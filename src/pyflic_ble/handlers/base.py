@@ -9,6 +9,10 @@ import logging
 from typing import TYPE_CHECKING, Any, Never
 
 from ..const import (
+    CONN_PARAM_INTERVAL_MAX,
+    CONN_PARAM_INTERVAL_MIN,
+    CONN_PARAM_LATENCY,
+    CONN_PARAM_TIMEOUT,
     DEVICE_NAME_MAX_BYTES,
     EVENT_TYPE_CLICK,
     EVENT_TYPE_DOUBLE_CLICK,
@@ -27,6 +31,8 @@ from ..const import (
 )
 
 if TYPE_CHECKING:
+    from bleak.backends.device import BLEDevice
+
     from ..rotate_tracker import RotateTracker
 
 _LOGGER = logging.getLogger(__name__)
@@ -45,6 +51,9 @@ class DeviceCapabilities:
     has_selector: bool  # True for Twist only (modes 1-11)
     has_gestures: bool  # True for Duo only (swipe gestures)
     has_frame_header: bool  # True for Flic2/Duo, False for Twist
+    # True when the handler owns the transport: it subscribes to several characteristics,
+    # authenticates its own packets and decides what a notification means (Flic 1).
+    raw_transport: bool = False
 
 
 @dataclass
@@ -73,7 +82,10 @@ class RotateEvent:
 WritePacketFn = Callable[[bytes, bool], Awaitable[None]]
 WaitForOpcodesFn = Callable[[list[int]], Awaitable[bytes]]
 WaitForOpcodeFn = Callable[[int], Awaitable[bytes]]
-WriteGattFn = Callable[[str, bytes], Awaitable[None]]
+WriteGattFn = Callable[..., Awaitable[None]]  # (char_uuid, data, response=False)
+ReadGattFn = Callable[[str], Awaitable[bytes]]
+# (pairing_id, pairing_key, sig_bits)
+CredentialsCallback = Callable[[int, bytes, int], None]
 
 
 async def _unbound_transport(*_args: object, **_kwargs: object) -> Never:
@@ -92,6 +104,8 @@ class DeviceProtocolHandler(ABC):
         self._write_packet: WritePacketFn = _unbound_transport
         self._wait_for_opcode: WaitForOpcodeFn = _unbound_transport
         self._wait_for_opcodes: WaitForOpcodesFn = _unbound_transport
+        self._read_gatt: ReadGattFn = _unbound_transport
+        self._credentials_callback: CredentialsCallback | None = None
 
     @property
     def connection_id(self) -> int:
@@ -109,12 +123,76 @@ class DeviceProtocolHandler(ABC):
         write_packet: WritePacketFn,
         wait_for_opcode: WaitForOpcodeFn,
         wait_for_opcodes: WaitForOpcodesFn,
+        read_gatt: ReadGattFn | None = None,
     ) -> None:
         """Bind transport callbacks for use by handler methods."""
         self._write_gatt = write_gatt
         self._write_packet = write_packet
         self._wait_for_opcode = wait_for_opcode
         self._wait_for_opcodes = wait_for_opcodes
+        self._read_gatt = read_gatt or _unbound_transport
+
+    def set_credentials_callback(self, callback: CredentialsCallback | None) -> None:
+        """Register a callback for credentials that change while the session runs.
+
+        Only handlers whose credentials carry session state (Flic 1: the replay
+        position) call it; the application should persist what it receives.
+        """
+        self._credentials_callback = callback
+
+    @property
+    def notify_char_uuids(self) -> tuple[str, ...]:
+        """Return every characteristic the client has to subscribe to."""
+        return (self.notify_char_uuid,)
+
+    @property
+    def connection_parameters(self) -> tuple[int, int, int, int]:
+        """Return (interval min, interval max, latency, timeout) to request from the proxy."""
+        return (
+            CONN_PARAM_INTERVAL_MIN,
+            CONN_PARAM_INTERVAL_MAX,
+            CONN_PARAM_LATENCY,
+            CONN_PARAM_TIMEOUT,
+        )
+
+    @property
+    def connection_parameters_after_verify(self) -> bool:
+        """Return True to request the connection parameters only once the session works."""
+        return False
+
+    @property
+    def advertises_when_disconnected_only(self) -> bool:
+        """Return True if a connectable advertisement proves that the link is gone."""
+        return False
+
+    def on_ble_device(self, ble_device: BLEDevice) -> None:
+        """Receive the BLE device (name, details) whenever the client gets a new one."""
+
+    def on_advertisement(self, manufacturer_data: dict[int, bytes]) -> None:
+        """Receive the manufacturer data of an advertisement."""
+
+    def handle_raw_notification(
+        self, char_uuid: str, data: bytes
+    ) -> tuple[list[ButtonEvent], bytes | None]:
+        """Handle a notification when ``capabilities.raw_transport`` is set.
+
+        Returns the button events and, for command replies, the frame the client
+        should queue for ``wait_for_opcode``.
+        """
+        raise NotImplementedError
+
+    async def liveness_probe(self) -> None:
+        """Do a cheap round trip that fails if the link is dead (Flic 1 reads the hello)."""
+        raise NotImplementedError
+
+    @property
+    def supports_battery_log(self) -> bool:
+        """Return True if the handler can read a battery log in the background."""
+        return False
+
+    async def read_battery_log(self) -> int | None:
+        """Read the battery log and return the raw battery value (None if empty)."""
+        raise NotImplementedError
 
     @property
     @abstractmethod
@@ -238,6 +316,7 @@ class DeviceProtocolHandler(ABC):
         self._write_packet = _unbound_transport
         self._wait_for_opcode = _unbound_transport
         self._wait_for_opcodes = _unbound_transport
+        self._read_gatt = _unbound_transport
 
     @staticmethod
     def _truncate_name_bytes(name: str) -> bytes:

@@ -7,6 +7,7 @@ from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass
 from enum import IntEnum
+import functools
 import logging
 from typing import Any
 
@@ -24,12 +25,17 @@ from .const import (
     CONN_PARAM_INTERVAL_MIN,
     CONN_PARAM_LATENCY,
     CONN_PARAM_TIMEOUT,
+    FLIC1_BATTERY_LOG_DELAY,
+    FLIC1_BATTERY_LOG_INTERVAL,
+    FLIC1_BATTERY_RAW_TO_VOLTS,
+    FLIC1_STALE_EVENT_AGE,
     FLIC_MAX_PACKET_SIZE,
     FLIC_MTU,
     FLIC_SIGNATURE_SIZE,
     FRAME_HEADER_CONN_ID_MASK,
     FRAME_HEADER_FRAGMENT_FLAG,
     FRAME_HEADER_NEWLY_ASSIGNED,
+    LIVENESS_PROBE_INTERVAL,
     OPCODE_FIRMWARE_UPDATE_NOTIFICATION,
     TWIST_DISCONNECT_REASON_INVALID_SIGNATURE,
     TWIST_DISCONNECT_REASON_OTHER_CLIENT,
@@ -45,6 +51,7 @@ from .handlers import (
     DeviceCapabilities,
     DeviceProtocolHandler,
     DuoProtocolHandler,
+    FlicCloudUnlock,
     TwistProtocolHandler,
     create_handler,
 )
@@ -91,7 +98,7 @@ class FlicState:
 
 
 class FlicClient:
-    """Flic 2/Duo/Twist BLE client implementing the Flic protocol.
+    """Flic 1/Flic 2/Duo/Twist BLE client implementing the Flic protocols.
 
     This class orchestrates BLE communication and delegates device-specific
     protocol handling to DeviceProtocolHandler implementations.
@@ -112,8 +119,15 @@ class FlicClient:
         device_type: DeviceType | None = None,
         sig_bits: int = 0,
         push_twist_mode: PushTwistMode = PushTwistMode.DEFAULT,
+        cloud_unlock: FlicCloudUnlock | None = None,
+        stale_event_age: float | None = FLIC1_STALE_EVENT_AGE,
     ) -> None:
-        """Initialize Flic client."""
+        """Initialize Flic client.
+
+        ``cloud_unlock`` (pairing a Flic 1) and ``stale_event_age`` (Flic 1: the age in
+        seconds above which a press queued while there was no link is not reported)
+        are ignored by the other device types.
+        """
         self.ble_device = ble_device
         self.address = address
         self._client: BleakClientWithServiceCache | None = None
@@ -138,8 +152,13 @@ class FlicClient:
 
         # Create protocol handler for this device type
         self._handler: DeviceProtocolHandler = create_handler(
-            self._device_type, push_twist_mode
+            self._device_type,
+            push_twist_mode,
+            address=address,
+            cloud_unlock=cloud_unlock,
+            stale_event_age=stale_event_age,
         )
+        self._handler.set_credentials_callback(self._handle_credentials_changed)
 
         # Session state
         self._session_key: bytes | None = None
@@ -180,11 +199,15 @@ class FlicClient:
         self._button_event_callbacks: list[Callable[[str, dict[str, Any]], None]] = []
         self._rotate_event_callbacks: list[Callable[[str, dict[str, Any]], None]] = []
         self._state_callbacks: list[Callable[[FlicState], None]] = []
+        self._credentials_callbacks: list[Callable[[int, bytes, int], None]] = []
 
         # Connection lifecycle state
         self._reconnect_lock = asyncio.Lock()
         self._reconnect_event = asyncio.Event()
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._probe_task: asyncio.Task[None] | None = None
+        self._next_probe_at = 0.0
+        self._battery_log_task: asyncio.Task[None] | None = None
         self._flic_state = FlicState(
             connected=False,
             battery_voltage=None,
@@ -256,11 +279,7 @@ class FlicClient:
             self._handler.reset_state()
 
         # Drain any stale messages from the response queue
-        while not self._response_queue.empty():
-            try:
-                self._response_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        self._drain_response_queue()
 
         # Reset fragment reassembly state
         self._fragment_buffer = bytearray()
@@ -268,6 +287,7 @@ class FlicClient:
 
         try:
             _LOGGER.info("Connecting to Flic button at %s", self.address)
+            self._handler.on_ble_device(self.ble_device)
             await close_stale_connections_by_address(self.address)
             self._client = await establish_connection(
                 BleakClientWithServiceCache,
@@ -308,17 +328,23 @@ class FlicClient:
                         FLIC_MTU,
                     )
 
-            # Request connection parameters for better responsiveness
-            await self._request_connection_parameters()
+            # Request connection parameters for better responsiveness (the Flic 1
+            # handler asks for them only once the session works)
+            if not self._handler.connection_parameters_after_verify:
+                await self._request_connection_parameters()
 
-            # Start notifications using handler's characteristic UUID
-            _LOGGER.debug(
-                "Starting notifications on characteristic %s",
-                self._handler.notify_char_uuid,
-            )
-            await self._client.start_notify(
-                self._handler.notify_char_uuid, self._notification_handler
-            )
+            # Start notifications using handler's characteristic UUID(s)
+            for char_uuid in self._handler.notify_char_uuids:
+                _LOGGER.debug("Starting notifications on characteristic %s", char_uuid)
+                if self._handler.capabilities.raw_transport:
+                    await self._client.start_notify(
+                        char_uuid,
+                        functools.partial(self._raw_notification_handler, char_uuid),
+                    )
+                else:
+                    await self._client.start_notify(
+                        char_uuid, self._notification_handler
+                    )
             _LOGGER.debug("Notifications started successfully for %s", self.address)
 
             self._state = SessionState.CONNECTED
@@ -333,6 +359,7 @@ class FlicClient:
                 write_packet=self._write_packet,
                 wait_for_opcode=self._wait_for_handler_opcode,
                 wait_for_opcodes=self._wait_for_handler_opcodes,
+                read_gatt=self._read_gatt,
             )
             _LOGGER.debug("Session state set to CONNECTED")
 
@@ -345,8 +372,17 @@ class FlicClient:
             _LOGGER.error("Failed to connect to %s: %s", self.address, err)
             raise FlicProtocolError(f"Failed to connect: {err}") from err
 
+    def _drain_response_queue(self) -> None:
+        """Discard responses that nobody waits for any more."""
+        while not self._response_queue.empty():
+            try:
+                self._response_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
     async def disconnect(self) -> None:
         """Disconnect from the Flic button."""
+        self._cancel_background_tasks()
         self._intentional_disconnect = True
         if self._client:
             try:
@@ -366,6 +402,7 @@ class FlicClient:
         _LOGGER.info("BLE connection lost to %s", self.address)
         self._state = SessionState.DISCONNECTED
         self._handler.reset_state()
+        self._cancel_background_tasks()
         if self._flic_state.connected:
             self._flic_state.connected = False
             self._notify_state_callbacks()
@@ -374,6 +411,17 @@ class FlicClient:
         # Attempt reconnection unless start() is already running or stopped
         if not self._starting and not self._stopped:
             self._schedule_reconnect()
+
+    def _cancel_background_tasks(self) -> None:
+        """Cancel the liveness probe and the battery log task.
+
+        The caller may be one of them (a probe that gives up the link): it carries on.
+        """
+        current = asyncio.current_task()
+        for task in (self._probe_task, self._battery_log_task):
+            if task and task is not current and not task.done():
+                task.cancel()
+        self._probe_task = self._battery_log_task = None
 
     async def _request_connection_parameters(self) -> None:
         """Request BLE connection parameters for optimal communication."""
@@ -384,13 +432,17 @@ class FlicClient:
             return
         try:
             await self._client.set_connection_params(
-                CONN_PARAM_INTERVAL_MIN,
-                CONN_PARAM_INTERVAL_MAX,
-                CONN_PARAM_LATENCY,
-                CONN_PARAM_TIMEOUT,
+                *self._handler.connection_parameters
             )
         except (BleakError, NotImplementedError) as err:
             _LOGGER.debug("Failed to request connection parameters: %s", err)
+        except Exception:  # noqa: BLE001
+            # Backend specific errors must not end a session that works without them
+            _LOGGER.warning(
+                "Failed to request connection parameters for %s",
+                self.address,
+                exc_info=True,
+            )
 
     @property
     def is_connected(self) -> bool:
@@ -442,6 +494,10 @@ class FlicClient:
             self._state = SessionState.FAILED
             _LOGGER.error("Pairing timeout")
             raise FlicPairingError("Pairing timeout") from err
+        except ValueError as err:
+            self._state = SessionState.FAILED
+            _LOGGER.error("Pairing failed: %s", err)
+            raise FlicPairingError(str(err)) from err
         else:
             return (
                 pairing_id,
@@ -458,7 +514,7 @@ class FlicClient:
         if self._state != SessionState.CONNECTED:
             raise FlicProtocolError("Not connected")
 
-        if not self._pairing_id or not self._pairing_key:
+        if self._pairing_id is None or not self._pairing_key:
             raise FlicProtocolError("No pairing credentials available")
 
         self._state = SessionState.WAIT_QUICK_VERIFY
@@ -481,6 +537,9 @@ class FlicClient:
         except TimeoutError as err:
             self._state = SessionState.FAILED
             raise FlicAuthenticationError("Quick verify timeout") from err
+        except ValueError as err:
+            self._state = SessionState.FAILED
+            raise FlicAuthenticationError(str(err)) from err
 
     async def init_button_events(self) -> None:
         """Initialize button event delivery."""
@@ -499,6 +558,19 @@ class FlicClient:
             session_key=self._session_key,
             chaskey_keys=self._chaskey_keys,
         )
+
+    def _handle_credentials_changed(
+        self, pairing_id: int, pairing_key: bytes, sig_bits: int
+    ) -> None:
+        """Keep the credentials a handler updated and tell the application."""
+        self._pairing_id = pairing_id
+        self._pairing_key = pairing_key
+        self._sig_bits = sig_bits
+        for cb in self._credentials_callbacks:
+            try:
+                cb(pairing_id, pairing_key, sig_bits)
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Error in credentials callback", exc_info=True)
 
     async def _send_connection_parameters(self) -> None:
         """Send Flic protocol connection parameters to the button."""
@@ -529,9 +601,12 @@ class FlicClient:
 
         Twist returns millivolts directly (2 AAA batteries).
         Flic 2/Duo return a 10-bit ADC value (0-1024, 3.6V reference).
+        Flic 1 reports a value on the scale of the Flic app (1136 = 2.0 V, 1705 = 3.0 V).
         """
         if device_type == DeviceType.TWIST:
             return raw / 1000.0
+        if device_type == DeviceType.FLIC1:
+            return raw * FLIC1_BATTERY_RAW_TO_VOLTS
         return raw * 3.6 / 1024.0
 
     async def get_battery_voltage(self) -> float:
@@ -582,6 +657,23 @@ class FlicClient:
 
         return unsubscribe
 
+    def register_credentials_callback(
+        self, callback: Callable[[int, bytes, int], None]
+    ) -> Callable[[], None]:
+        """Register a callback for credentials that change during a session.
+
+        Called with (pairing_id, pairing_key, sig_bits) when a Flic 1 receives an
+        event: the application should store them so that a restart does not replay
+        events. Returns an unsubscribe function.
+        """
+        self._credentials_callbacks.append(callback)
+
+        def unsubscribe() -> None:
+            with contextlib.suppress(ValueError):
+                self._credentials_callbacks.remove(callback)
+
+        return unsubscribe
+
     def register_state_callback(
         self, callback: Callable[[FlicState], None]
     ) -> Callable[[], None]:
@@ -620,6 +712,8 @@ class FlicClient:
             await self.connect()
             await self.quick_verify()
             await self.init_button_events()
+            if self._handler.connection_parameters_after_verify:
+                await self._request_connection_parameters()
             await self._send_connection_parameters()
 
             # Request battery level (non-fatal)
@@ -628,8 +722,13 @@ class FlicClient:
                 self._flic_state.battery_voltage = voltage
                 _LOGGER.debug("Battery voltage for %s: %.3fV", self.address, voltage)
             except Exception:  # noqa: BLE001
-                _LOGGER.warning(
-                    "Failed to retrieve battery level from %s", self.address
+                # Flic 1 only knows the battery once it advertised or the log was read
+                _LOGGER.log(
+                    logging.DEBUG
+                    if self._handler.supports_battery_log
+                    else logging.WARNING,
+                    "Failed to retrieve battery level from %s",
+                    self.address,
                 )
 
             # Request firmware version (non-fatal)
@@ -653,12 +752,56 @@ class FlicClient:
             self._notify_state_callbacks()
             _LOGGER.info("Successfully started session with %s", self.address)
 
-        except (TimeoutError, BleakError, FlicProtocolError) as err:
+            if self._handler.supports_battery_log:
+                self._battery_log_task = asyncio.get_running_loop().create_task(
+                    self._async_battery_log_loop(),
+                    name=f"flic-battery-{self.address}",
+                )
+
+        except Exception as err:
             self._flic_state.connected = False
             _LOGGER.error("Failed to start session with %s: %s", self.address, err)
+            await self._abort_session()
             raise
         finally:
             self._starting = False
+
+    async def _abort_session(self) -> None:
+        """Drop the BLE link of a session that could not be established.
+
+        A link that stays up with no verified session would never be retried:
+        the reconnect loop only runs while the client is disconnected.
+        """
+        if (
+            self._firmware_update_active
+            or self.address in FlicClient._firmware_update_addresses
+        ):
+            # The link belongs to a running firmware transfer
+            return
+        self._cancel_background_tasks()
+        try:
+            await self.disconnect()
+        finally:
+            self._intentional_disconnect = False
+
+    async def _async_battery_log_loop(self) -> None:
+        """Read the battery log in the background while the link is up (Flic 1)."""
+        # Queued presses and their acknowledgements go first
+        await asyncio.sleep(FLIC1_BATTERY_LOG_DELAY)
+        while self.is_connected and not self._stopped:
+            # An earlier request that timed out may have left frames behind
+            self._drain_response_queue()
+            try:
+                raw = await self._handler.read_battery_log()
+            except (TimeoutError, BleakError, ValueError):
+                _LOGGER.debug("Battery log of %s not read", self.address, exc_info=True)
+                raw = None
+            if raw is not None:
+                voltage = self.battery_raw_to_voltage(raw, self._device_type)
+                self._flic_state.battery_voltage = voltage
+                _LOGGER.debug("Battery voltage for %s: %.3fV", self.address, voltage)
+                self._notify_state_callbacks()
+            await asyncio.sleep(FLIC1_BATTERY_LOG_INTERVAL)
 
     async def stop(self) -> None:
         """Disconnect and clean up."""
@@ -669,15 +812,64 @@ class FlicClient:
             self._reconnect_task = None
         await self.disconnect()
 
-    def set_ble_device(self, ble_device: BLEDevice) -> None:
+    def set_ble_device(
+        self,
+        ble_device: BLEDevice,
+        manufacturer_data: dict[int, bytes] | None = None,
+    ) -> None:
         """Update the BLE device reference.
 
         If disconnected, automatically triggers a reconnection attempt.
         Wakes any sleeping reconnect loop to retry immediately.
+        ``manufacturer_data`` is the one of the advertisement (Flic 1 reports its
+        battery there).
         """
         self.ble_device = ble_device
+        self._handler.on_ble_device(ble_device)
+        if manufacturer_data:
+            self._handler.on_advertisement(manufacturer_data)
         self._reconnect_event.set()
         if not self.is_connected and not self._starting and not self._stopped:
+            self._schedule_reconnect()
+        elif self.is_connected and self._handler.advertises_when_disconnected_only:
+            self._schedule_probe()
+
+    def _schedule_probe(self) -> None:
+        """Check a link that looks up although the button advertises.
+
+        A Flic 1 only advertises while it has no link. If it does, the link is
+        probably gone without anyone being told (a proxy whose Bluetooth stack hung).
+        """
+        loop = asyncio.get_running_loop()
+        if (
+            self._state != SessionState.SESSION_ESTABLISHED
+            or (self._probe_task and not self._probe_task.done())
+            or loop.time() < self._next_probe_at
+        ):
+            return
+        self._next_probe_at = loop.time() + LIVENESS_PROBE_INTERVAL
+        self._probe_task = loop.create_task(
+            self._async_probe(), name=f"flic-probe-{self.address}"
+        )
+
+    async def _async_probe(self) -> None:
+        """Probe the link and rebuild it if the button does not answer."""
+        try:
+            await self._handler.liveness_probe()
+        except (TimeoutError, BleakError):
+            _LOGGER.warning(
+                "%s advertises although the link looks up and does not answer, "
+                "reconnecting",
+                self.address,
+            )
+        else:
+            return
+        await self._abort_session()
+        self._flic_state.connected = False
+        self._notify_state_callbacks()
+        if self.on_disconnect:
+            self.on_disconnect()
+        if not self._stopped:
             self._schedule_reconnect()
 
     def _schedule_reconnect(self) -> None:
@@ -715,10 +907,18 @@ class FlicClient:
         """
         delay = 5
         max_delay = 300
+        # Minimum time between two attempts, doubled by every failure. A new
+        # advertisement wakes the loop at once, but a failing proxy or button
+        # (a Flic 1 advertises continuously) must not be hammered.
+        gap = 0.0
+        last_attempt = 0.0
+        loop = asyncio.get_running_loop()
         _LOGGER.debug(
             "Starting reconnect loop for %s", self.address
         )
         while not self.is_connected and not self._stopped:
+            if (pause := last_attempt + gap - loop.time()) > 0:
+                await asyncio.sleep(pause)
             async with self._reconnect_lock:
                 if self.is_connected or self._stopped:
                     return
@@ -729,9 +929,11 @@ class FlicClient:
                     _LOGGER.debug(
                         "Attempting to reconnect to %s", self.address
                     )
+                    last_attempt = loop.time()
                     await self._start_inner()
                     return
                 except Exception:  # noqa: BLE001
+                    gap = min(max(gap * 2, 1.0), 30.0)
                     _LOGGER.debug(
                         "Reconnection to %s failed, retrying in %ds",
                         self.address,
@@ -816,12 +1018,28 @@ class FlicClient:
             self._firmware_update_active = False
             FlicClient._firmware_update_addresses.discard(self.address)
 
-    async def _write_gatt(self, char_uuid: str, data: bytes) -> None:
-        """Write data to a GATT characteristic."""
+    async def _write_gatt(
+        self, char_uuid: str, data: bytes, response: bool | None = None
+    ) -> None:
+        """Write data to a GATT characteristic.
+
+        ``response`` selects write with or without response; None keeps the default
+        of the Bluetooth backend.
+        """
         if not self._client:
             raise FlicProtocolError("Not connected")
 
-        await self._client.write_gatt_char(char_uuid, data)
+        if response is None:
+            await self._client.write_gatt_char(char_uuid, data)
+        else:
+            await self._client.write_gatt_char(char_uuid, data, response=response)
+
+    async def _read_gatt(self, char_uuid: str) -> bytes:
+        """Read a GATT characteristic."""
+        if not self._client:
+            raise FlicProtocolError("Not connected")
+
+        return bytes(await self._client.read_gatt_char(char_uuid))
 
     def _fragment_packet(
         self, packet: bytes, max_fragment_size: int = 20
@@ -960,6 +1178,26 @@ class FlicClient:
             else:
                 self._handle_unframed_notification(data)
 
+        except Exception:
+            _LOGGER.exception("Error handling notification")
+
+    def _raw_notification_handler(
+        self, char_uuid: str, _sender: Any, data: bytearray
+    ) -> None:
+        """Handle a notification of a device that owns its transport (Flic 1)."""
+        try:
+            _LOGGER.debug(
+                "Received notification on %s: %s (%d bytes)",
+                char_uuid,
+                bytes(data).hex(),
+                len(data),
+            )
+            button_events, response = self._handler.handle_raw_notification(
+                char_uuid, bytes(data)
+            )
+            self._emit_button_events(button_events)
+            if response is not None:
+                self._response_queue.put_nowait(response)
         except Exception:
             _LOGGER.exception("Error handling notification")
 

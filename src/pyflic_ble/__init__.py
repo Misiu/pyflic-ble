@@ -9,13 +9,17 @@ from .client import (
     FlicState,
 )
 from .const import DeviceType, PushTwistMode
+from .handlers import FlicCloudUnlock
 from .handlers.base import DeviceCapabilities
+from .protocol import Flic1UnlockRequest
 
 __all__ = [
     "DeviceCapabilities",
     "DeviceType",
+    "Flic1UnlockRequest",
     "FlicAuthenticationError",
     "FlicClient",
+    "FlicCloudUnlock",
     "FlicFirmwareUpdateError",
     "FlicPairingError",
     "FlicProtocolError",

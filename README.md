@@ -1,11 +1,12 @@
 # pyflic-ble
 
-Python library for communicating with [Flic](https://flic.io/) smart buttons over Bluetooth Low Energy (BLE). Supports the full Flic 2 protocol including pairing, authentication, button events, rotation tracking, firmware updates, and device name management.
+Python library for communicating with [Flic](https://flic.io/) smart buttons over Bluetooth Low Energy (BLE). Supports the full Flic 2 protocol including pairing, authentication, button events, rotation tracking, firmware updates, and device name management, as well as the first generation Flic 1 (pairing, button events, and battery).
 
 ## Supported Devices
 
 | Device | Button(s) | Rotation | Gestures | Selector Modes |
 |--------|-----------|----------|----------|----------------|
+| **Flic 1** | 1 | — | — | — |
 | **Flic 2** | 1 | — | — | — |
 | **Flic Duo** | 2 | Dial (per-button) | Swipe (left/right/up/down) | — |
 | **Flic Twist** | 1 | Full rotation | — | 12 slots + free mode |
@@ -101,9 +102,17 @@ client = FlicClient(
     device_type=DeviceType.TWIST,
     push_twist_mode=PushTwistMode.CONTINUOUS,
 )
+
+# Flic 1 (see Flic 1 below)
+client = FlicClient(
+    address="AA:BB:CC:DD:EE:FF",
+    ble_device=ble_device,
+    device_type=DeviceType.FLIC1,
+    cloud_unlock=cloud_unlock,  # only needed for pairing
+)
 ```
 
-The device type is auto-detected from the serial number prefix (`T` = Twist, `D` = Duo, anything else = Flic 2), or can be specified explicitly.
+The device type is auto-detected from the serial number prefix (`T` = Twist, `D` = Duo, anything else = Flic 2), or can be specified explicitly. A Flic 1 has to be specified explicitly.
 
 ### Pairing (First Connection)
 
@@ -119,6 +128,34 @@ pairing_id, pairing_key, serial, battery, sig_bits, button_uuid, firmware_versio
 
 await client.init_button_events()
 ```
+
+### Flic 1
+
+Flic 1 predates the other devices and uses a different protocol: two GATT characteristics instead of framed packets, and SHA-256 MACs instead of Chaskey and Ed25519. Pass `device_type=DeviceType.FLIC1`.
+
+**Pairing needs the Flic cloud once.** The cloud holds the secret that unlocks a button. The library does not make the HTTP call (the application owns the app credentials and the HTTP client); provide it as a `cloud_unlock` coroutine that posts the request body to the unlock endpoint and returns the reply text:
+
+```python
+from pyflic_ble import Flic1UnlockRequest
+
+async def cloud_unlock(button_uuid: str, random_bytes: bytes, button_nonce: bytes) -> str:
+    body = Flic1UnlockRequest(APP_ID, APP_SECRET, random_bytes, button_nonce).to_json()
+    async with session.post(
+        f"https://api.flic.io/api/v1/buttons/{button_uuid}/unlock",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    ) as response:
+        response.raise_for_status()
+        return await response.text()
+```
+
+The button has to be in pairing mode (hold it for 7 seconds). `full_verify_pairing()` then returns the usual tuple; `pairing_key` is the 20 byte secret. Later sessions (`start()`, `quick_verify()`) do not need the internet.
+
+- **Credentials change during a session.** `pairing_id` and `sig_bits` hold the event counter, the boot id, and the events already received. They advance with every event, so store the values from `register_credentials_callback()`; otherwise a restart may report events again.
+- **Queued presses.** A button that has no link queues presses and reports them after the next connection with `was_queued` set. Presses older than `stale_event_age` seconds (5 by default) are acknowledged but not reported; pass `stale_event_age=None` to report all of them.
+- **Battery.** A Flic 1 has no battery request. Pass the manufacturer data of its advertisements to `set_ble_device(ble_device, manufacturer_data)` for the live value; otherwise the client reads the battery log in the background after connecting and every 3 hours. `get_battery_level()` returns the raw value on the scale of the Flic app, `get_battery_voltage()` the voltage.
+- **Link check.** A connected Flic 1 does not advertise. An advertisement that arrives while the client believes it is connected means the link is gone (for example a Bluetooth proxy that hung), so the client checks the link and reconnects if the button does not answer.
+- **Several adapters.** In private mode a Flic 1 only answers the adapter it was paired through; connecting through another one fails.
 
 ### Starting a Session (Recommended)
 
@@ -275,7 +312,12 @@ When a BLE connection drops unexpectedly, the client automatically attempts to r
 ```python
 # Typically called from a BLE scanner callback
 client.set_ble_device(new_ble_device)
+
+# Flic 1: also pass the manufacturer data, it carries the battery value
+client.set_ble_device(new_ble_device, advertisement_data.manufacturer_data)
 ```
+
+Failed attempts are spaced at least 1 s apart (doubling up to 30 s), so advertisements that arrive faster do not make the client hammer a failing button or proxy.
 
 The reconnect loop runs until the connection is restored or `stop()` is called. No manual intervention is needed.
 
@@ -299,7 +341,8 @@ caps.button_count    # 1 for Flic 2/Twist, 2 for Duo
 caps.has_rotation    # True for Duo and Twist
 caps.has_selector    # True for Twist only (12 selector modes)
 caps.has_gestures    # True for Duo only (swipe gestures)
-caps.has_frame_header  # True for Flic 2/Duo, False for Twist
+caps.has_frame_header  # True for Flic 2/Duo, False for Twist/Flic 1
+caps.raw_transport   # True for Flic 1 (the handler frames and signs its own packets)
 ```
 
 ## Protocol Details
@@ -312,6 +355,7 @@ The Flic protocol uses multiple cryptographic layers:
 - **X25519 ECDH** — Ephemeral key exchange during pairing to establish a shared secret.
 - **HMAC-SHA256** — Key derivation for session keys and pairing credentials from the shared secret.
 - **Chaskey-LTS** — Lightweight MAC algorithm for authenticating every packet in an established session. Uses a 5-byte truncated MAC with direction bit and packet counter to prevent replay.
+- **SHA-256 MACs (Flic 1)** — Flic 1 predates the layers above. Packets and events are signed with a truncated SHA-256 keyed with a secret from pairing (the Flic cloud provides it). The button numbers its events, and the library drops events it has already received.
 
 ### Flic 2/Duo vs Twist Protocol Differences
 

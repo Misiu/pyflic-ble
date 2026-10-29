@@ -9,13 +9,18 @@ from typing import Final
 class DeviceType(StrEnum):
     """Flic device types."""
 
+    FLIC1 = "flic1"
     FLIC2 = "flic2"
     DUO = "duo"
     TWIST = "twist"
 
     @classmethod
     def from_serial_number(cls, serial: str) -> DeviceType:
-        """Detect device type from serial number prefix."""
+        """Detect device type from serial number prefix.
+
+        Flic 1 serials have no reliable prefix: a Flic 1 is recognised by its BLE
+        service UUID (FLIC1_SERVICE_UUID) and has to be passed as device_type.
+        """
         if serial.startswith("T"):
             return cls.TWIST
         if serial.startswith("D"):
@@ -40,6 +45,14 @@ FLIC_NOTIFY_CHAR_UUID: Final = "00420002-8f59-4420-870d-84f3b617e493"
 TWIST_SERVICE_UUID: Final = "00c90000-2cbd-4f2a-a725-5ccd960ffb7d"
 TWIST_TX_CHAR_UUID: Final = "00c90001-2cbd-4f2a-a725-5ccd960ffb7d"
 TWIST_RX_CHAR_UUID: Final = "00c90002-2cbd-4f2a-a725-5ccd960ffb7d"
+
+# Flic 1 (first generation) BLE service and characteristics
+FLIC1_SERVICE_UUID: Final = "f02adfc0-26e7-11e4-9edc-0002a5d5c51b"
+FLIC1_CONFIG_CHAR_UUID: Final = "cc7efce0-26e8-11e4-8fd2-0002a5d5c51b"  # hello (read), verify and config (write, notify)
+FLIC1_EVENT_CHAR_UUID: Final = (
+    "06053ec0-26e9-11e4-adc2-0002a5d5c51b"  # button events (notify)
+)
+GAP_DEVICE_NAME_CHAR_UUID: Final = "00002a00-0000-1000-8000-00805f9b34fb"
 
 # Ed25519 public keys for signature verification
 FLIC2_ED25519_PUBLIC_KEY: Final = bytes.fromhex(
@@ -95,6 +108,7 @@ EVENT_TYPE_DUO_DIAL_CHANGED: Final = "duo_dial_changed"
 PAIRING_TIMEOUT: Final = 60
 CONNECTION_TIMEOUT: Final = 30
 COMMAND_TIMEOUT: Final = 10
+LIVENESS_PROBE_INTERVAL: Final = 30  # at most one liveness probe per interval
 
 # BLE connection parameters
 CONN_PARAM_LATENCY: Final = 17
@@ -240,3 +254,66 @@ TWIST_OPCODE_SET_NAME_RESPONSE: Final = 0x0D
 
 # Name constraints
 DEVICE_NAME_MAX_BYTES: Final = 23
+
+# Flic 1 message sizes
+FLIC1_HELLO_SIZE: Final = 20
+FLIC1_EVENT_SIZE: Final = 15
+FLIC1_READY_FRAME_BYTE: Final = 0x40
+
+# Flic 1 opcodes (Host -> Device, written to the configuration characteristic)
+FLIC1_OPCODE_CONFIG_REQUEST: Final = 0x06
+FLIC1_OPCODE_FULL_VERIFY_REQUEST: Final = 0x07
+FLIC1_OPCODE_QUICK_VERIFY_REQUEST: Final = 0x09
+FLIC1_OPCODE_BATTERY_LOG_REQUEST: Final = 0x18
+FLIC1_OPCODE_BATTERY_LOG_FROM_REQUEST: Final = 0x19
+FLIC1_OPCODE_ACK_EVENTS: Final = 0x25
+
+# Flic 1 opcodes (Device -> Host, notified on the configuration characteristic)
+FLIC1_OPCODE_FULL_VERIFY_RESPONSE_1: Final = 0
+FLIC1_OPCODE_FULL_VERIFY_RESPONSE_2: Final = 1
+FLIC1_OPCODE_FULL_VERIFY_RESPONSE_3: Final = 2
+FLIC1_OPCODE_BATTERY_LOG_HEADER: Final = 5
+FLIC1_OPCODE_BATTERY_LOG_DATA: Final = 6
+
+# Flic 1 full verify steps (second byte of FLIC1_OPCODE_FULL_VERIFY_REQUEST)
+FLIC1_FULL_VERIFY_STEP_1: Final = 0
+FLIC1_FULL_VERIFY_STEP_2: Final = 1
+
+# Flic 1 hello flags (first byte of the hello); 0x40 is a paired button that only accepts
+# a quick verify
+FLIC1_HELLO_FLAG_QUICK_VERIFY_OR_PAIRING: Final = 0x41
+FLIC1_HELLO_FLAG_PAIRING: Final = 0x42
+FLIC1_HELLO_FLAG_PAIRING_WITH_BOND: Final = 0x43
+
+# Flic 1 event frames that carry connection parameters instead of a press
+FLIC1_EVENT_STATUS_BYTES: Final = frozenset({0x20, 0x60, 0x68, 0x70})
+
+# Flic 1 auto disconnect: seconds after the last press, 511 = stay connected
+FLIC1_AUTO_DISCONNECT_NEVER: Final = 511
+
+# Flic 1 connection parameters: flicd's "normal" interval and latency (the same idle wake-up
+# every ~2 s) with a 20 s instead of a 5 s link timeout, which a weak proxy link needs.
+FLIC1_CONN_PARAM_INTERVAL_MIN: Final = 70
+FLIC1_CONN_PARAM_INTERVAL_MAX: Final = 80
+FLIC1_CONN_PARAM_LATENCY: Final = 19
+FLIC1_CONN_PARAM_TIMEOUT: Final = 2000
+
+# Flic 1 buttons from the first production batch need acknowledged writes
+FLIC1_WRITE_REQUEST_ADDRESS_FIRST: Final = 0x80E4DA700000
+FLIC1_WRITE_REQUEST_ADDRESS_LAST: Final = 0x80E4DA707254
+
+# Presses that waited longer than this (seconds) for a link are not reported
+FLIC1_STALE_EVENT_AGE: Final = 5.0
+
+# Flic 1 battery
+FLIC1_MANUFACTURER_ID: Final = 0x030F  # advertisement manufacturer data, firmware >= 12
+FLIC1_BATTERY_LOG_CHUNK_SIZE: Final = 19  # entries in one data frame
+FLIC1_BATTERY_LOG_BLOCK_SIZE: Final = 285  # entries the button sends per request
+FLIC1_BATTERY_LOG_AVERAGED_ENTRIES: Final = 8
+FLIC1_BATTERY_ENTRY_OFFSET: Final = 1100  # raw value = offset + scale * entry
+FLIC1_BATTERY_ENTRY_SCALE: Final = 3
+FLIC1_BATTERY_RAW_TO_VOLTS: Final = 3.6 / 2048
+FLIC1_BATTERY_LOG_TIMEOUT: Final = 20
+FLIC1_BATTERY_LOG_DELAY: Final = 30  # seconds after connecting, queued presses go first
+FLIC1_BATTERY_LOG_INTERVAL: Final = 3 * 3600
+FLIC1_PROBE_TIMEOUT: Final = 8

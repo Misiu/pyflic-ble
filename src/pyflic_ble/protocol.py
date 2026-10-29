@@ -1,4 +1,4 @@
-"""Flic 2/Duo message protocol dataclasses.
+"""Flic message protocol dataclasses (Flic 2/Duo, Twist and Flic 1).
 
 This module implements the Flic protocol message types following the SDK pattern,
 with each message type as a distinct dataclass with to_bytes() for serialization
@@ -9,13 +9,32 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+import json
 import struct
 from typing import TYPE_CHECKING
 
 from .const import (
     DUO_FIRMWARE_STATUS_INTERVAL,
+    EVENT_TYPE_CLICK,
+    EVENT_TYPE_DOUBLE_CLICK,
+    EVENT_TYPE_DOWN,
+    EVENT_TYPE_HOLD,
+    EVENT_TYPE_UP,
     FIRMWARE_HEADER_SIZE,
     FIRMWARE_STATUS_INTERVAL,
+    FLIC1_EVENT_SIZE,
+    FLIC1_FULL_VERIFY_STEP_1,
+    FLIC1_FULL_VERIFY_STEP_2,
+    FLIC1_HELLO_SIZE,
+    FLIC1_OPCODE_ACK_EVENTS,
+    FLIC1_OPCODE_BATTERY_LOG_FROM_REQUEST,
+    FLIC1_OPCODE_BATTERY_LOG_HEADER,
+    FLIC1_OPCODE_BATTERY_LOG_REQUEST,
+    FLIC1_OPCODE_CONFIG_REQUEST,
+    FLIC1_OPCODE_FULL_VERIFY_REQUEST,
+    FLIC1_OPCODE_FULL_VERIFY_RESPONSE_1,
+    FLIC1_OPCODE_FULL_VERIFY_RESPONSE_2,
+    FLIC1_OPCODE_QUICK_VERIFY_REQUEST,
     FLIC2_FIRMWARE_IV_SIZE,
     FLIC2_FIRMWARE_STATUS_INTERVAL,
     OPCODE_ENABLE_PUSH_TWIST_IND,
@@ -1835,3 +1854,332 @@ class DuoFirmwareUpdateDataInd:
             struct.pack("<BB", frame_header, OPCODE_FIRMWARE_UPDATE_DATA_DUO_IND)
             + self.chunk_data
         )
+
+
+# =============================================================================
+# Flic 1 Protocol Messages
+# =============================================================================
+# Flic 1 has no frame header and no Chaskey MAC. Requests are 'opcode | payload'; the
+# authenticated ones get 'counter (1 byte) | MAC (4 bytes)' appended by the handler.
+
+
+@dataclass
+class Flic1Hello:
+    """Flic 1 hello, read from the configuration characteristic after connecting."""
+
+    raw: bytes
+    flag: int  # FLIC1_HELLO_FLAG_*
+    nonce: bytes  # 8 bytes
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Flic1Hello:
+        """Parse from bytes."""
+        if len(data) != FLIC1_HELLO_SIZE:
+            msg = f"Flic 1 hello must be {FLIC1_HELLO_SIZE} bytes, got {len(data)}"
+            raise ValueError(msg)
+        return cls(raw=bytes(data), flag=data[0], nonce=bytes(data[1:9]))
+
+
+@dataclass
+class Flic1FullVerifyRequest1:
+    """Flic 1 full verify request step 1 - initiates pairing."""
+
+    random_bytes: bytes  # 8 bytes
+
+    def to_bytes(self) -> bytes:
+        """Serialize to bytes."""
+        return (
+            bytes([FLIC1_OPCODE_FULL_VERIFY_REQUEST, FLIC1_FULL_VERIFY_STEP_1])
+            + self.random_bytes
+        )
+
+
+@dataclass
+class Flic1FullVerifyRequest2:
+    """Flic 1 full verify request step 2 - proves that the cloud unlocked the button."""
+
+    cloud_random: int  # r3 from the Flic cloud
+    h1: bytes  # 8 bytes
+
+    def to_bytes(self) -> bytes:
+        """Serialize to bytes."""
+        return (
+            bytes([FLIC1_OPCODE_FULL_VERIFY_REQUEST, FLIC1_FULL_VERIFY_STEP_2])
+            + (self.cloud_random & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+            + self.h1
+        )
+
+
+@dataclass
+class Flic1QuickVerifyRequest:
+    """Flic 1 quick verify request - reconnect with the stored pairing secret."""
+
+    h1: bytes  # 8 bytes
+    random_bytes: bytes  # 6 bytes
+
+    def to_bytes(self) -> bytes:
+        """Serialize to bytes."""
+        return bytes([FLIC1_OPCODE_QUICK_VERIFY_REQUEST]) + self.h1 + self.random_bytes
+
+
+@dataclass
+class Flic1ConfigRequest:
+    """Flic 1 configuration request."""
+
+    auto_disconnect_time: int  # seconds after the last press, 511 = never (9 bits)
+
+    def to_bytes(self) -> bytes:
+        """Serialize to bytes.
+
+        The six bytes of connection parameters stay zero: they are set on the
+        BLE link by the Bluetooth proxy (flicd does the same).
+        """
+        return (
+            bytes([FLIC1_OPCODE_CONFIG_REQUEST])
+            + bytes(6)
+            + (self.auto_disconnect_time & 0x1FF).to_bytes(2, "little")
+        )
+
+
+@dataclass
+class Flic1AckEventsRequest:
+    """Flic 1 acknowledgement of the last event received.
+
+    The button drops the events it already delivered and queues the rest.
+    """
+
+    counter: int  # 24 bit event counter
+    boot_id: int  # 24 bit boot counter
+    mask: int  # which event kinds of that counter were received
+
+    def to_bytes(self) -> bytes:
+        """Serialize to bytes."""
+        return (
+            bytes([FLIC1_OPCODE_ACK_EVENTS])
+            + self.counter.to_bytes(4, "little")
+            + self.boot_id.to_bytes(4, "little")
+            + bytes([self.mask & 0xFF])
+        )
+
+
+@dataclass
+class Flic1BatteryLogRequest:
+    """Flic 1 request for the header of the battery log."""
+
+    def to_bytes(self) -> bytes:
+        """Serialize to bytes."""
+        return bytes([FLIC1_OPCODE_BATTERY_LOG_REQUEST])
+
+
+@dataclass
+class Flic1BatteryLogFromRequest:
+    """Flic 1 request for the battery log entries from a position on."""
+
+    position: int
+
+    def to_bytes(self) -> bytes:
+        """Serialize to bytes."""
+        return bytes([FLIC1_OPCODE_BATTERY_LOG_FROM_REQUEST]) + self.position.to_bytes(
+            4, "little"
+        )
+
+
+@dataclass
+class Flic1FullVerifyResponse1:
+    """Flic 1 full verify response step 1 - the button's nonce and its half of the proof."""
+
+    nonce: bytes  # 8 bytes
+    h2: bytes  # 8 bytes
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Flic1FullVerifyResponse1:
+        """Parse from bytes."""
+        if (
+            len(data) < FLIC1_HELLO_SIZE
+            or data[0] != FLIC1_OPCODE_FULL_VERIFY_RESPONSE_1
+        ):
+            msg = "Not a Flic 1 full verify response 1"
+            raise ValueError(msg)
+        return cls(nonce=bytes(data[1:9]), h2=bytes(data[9:17]))
+
+
+@dataclass
+class Flic1FullVerifyResponse2:
+    """Flic 1 full verify response step 2 - the button uuid."""
+
+    button_uuid: bytes  # 16 bytes
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Flic1FullVerifyResponse2:
+        """Parse from bytes."""
+        if (
+            len(data) < FLIC1_HELLO_SIZE
+            or data[0] != FLIC1_OPCODE_FULL_VERIFY_RESPONSE_2
+        ):
+            msg = "Not a Flic 1 full verify response 2"
+            raise ValueError(msg)
+        return cls(button_uuid=bytes(data[1:17]))
+
+
+@dataclass
+class Flic1BatteryLogHeader:
+    """Flic 1 battery log header: entries in the log and entries the button can send."""
+
+    entries: int
+    available_entries: int
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Flic1BatteryLogHeader:
+        """Parse from bytes."""
+        if len(data) < 11 or data[0] != FLIC1_OPCODE_BATTERY_LOG_HEADER:
+            msg = "Not a Flic 1 battery log header"
+            raise ValueError(msg)
+        return cls(
+            entries=int.from_bytes(data[1:3], "little"),
+            available_entries=int.from_bytes(data[7:11], "little"),
+        )
+
+
+@dataclass
+class Flic1EventNotification:
+    """Flic 1 button event frame: event byte, counter, boot id, age and MAC (15 bytes)."""
+
+    event_byte: int
+    counter: int  # 24 bit
+    boot_id: int  # 24 bit
+    age: int  # seconds since the press, for events queued while there was no link
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Flic1EventNotification:
+        """Parse from bytes (the MAC has to be checked by the caller)."""
+        if len(data) < FLIC1_EVENT_SIZE:
+            msg = f"Flic 1 event must be {FLIC1_EVENT_SIZE} bytes, got {len(data)}"
+            raise ValueError(msg)
+        return cls(
+            event_byte=data[0],
+            counter=int.from_bytes(data[1:4], "little"),
+            boot_id=int.from_bytes(data[4:7], "little"),
+            age=int.from_bytes(data[7:11], "little"),
+        )
+
+    @property
+    def was_queued(self) -> bool:
+        """Return True if the button queued the press while there was no link."""
+        return bool(self.event_byte & 0x10)
+
+    @property
+    def needs_ack(self) -> bool:
+        """Return True if the button waits for an acknowledgement of this event."""
+        kind = self.event_byte & 3
+        return kind in (2, 3) if self.event_byte & 8 else kind == 2
+
+    @property
+    def event_kind(self) -> int:
+        """Return the event kind that the replay filter tracks (0-3)."""
+        return 0 if self.event_byte & 8 else self.event_byte & 3
+
+    @property
+    def event_types(self) -> list[str]:
+        """Return the event types (EVENT_TYPE_*) this frame stands for."""
+        byte = self.event_byte
+        kind = byte & 3
+        if byte & 8:
+            # Newer firmware decides between click types on the button
+            types = [EVENT_TYPE_UP]
+            if kind == 2 and not byte & 4:
+                types.append(EVENT_TYPE_CLICK)
+            elif kind == 3:
+                types.append(EVENT_TYPE_DOUBLE_CLICK)
+            return types
+        if kind == 1:
+            return [EVENT_TYPE_DOWN]
+        if kind == 2:
+            return [EVENT_TYPE_CLICK]
+        if kind == 3:
+            return [] if byte & 0xF == 7 else [EVENT_TYPE_HOLD]
+        return [EVENT_TYPE_UP]
+
+
+@dataclass
+class Flic1AdvertisedData:
+    """Flic 1 manufacturer data of the advertisement (16 bytes, first byte 0)."""
+
+    index: int
+    boot_battery: int  # raw battery value at boot
+    time: int
+    battery: int  # live raw battery value, same scale as the battery log
+    boot_counter: int
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Flic1AdvertisedData:
+        """Parse from bytes."""
+        if len(data) != 16 or data[0] != 0:
+            msg = "Not Flic 1 manufacturer data"
+            raise ValueError(msg)
+        return cls(
+            index=data[1],
+            boot_battery=int.from_bytes(data[2:4], "little"),
+            time=int.from_bytes(data[4:8], "little"),
+            battery=int.from_bytes(data[8:10], "little"),
+            boot_counter=int.from_bytes(data[10:12], "little") | data[12] << 16,
+        )
+
+
+@dataclass
+class Flic1UnlockRequest:
+    """Body of the Flic cloud call ``POST /api/v1/buttons/<uuid>/unlock``.
+
+    The application owns the app credentials and the HTTP client.
+    """
+
+    app_id: str
+    app_secret: str
+    random_bytes: bytes  # the 8 bytes sent to the button in full verify request 1
+    button_nonce: bytes  # 8 bytes from full verify response 1
+
+    def to_json(self) -> str:
+        """Serialize to the JSON text of the request body."""
+        return json.dumps(
+            {
+                "appId": self.app_id,
+                "appSecret": self.app_secret,
+                "r1": int.from_bytes(self.random_bytes, "little", signed=True),
+                "r2": int.from_bytes(self.button_nonce, "little", signed=True),
+                "platform": "linux",
+                "version": "0.2",
+            },
+            separators=(",", ":"),
+        )
+
+
+@dataclass
+class Flic1UnlockResponse:
+    """Reply of the Flic cloud to the unlock request."""
+
+    mac_address: str
+    h1: bytes  # 8 bytes
+    h2: bytes  # 8 bytes
+    h3: bytes  # 12 bytes
+    cloud_random: int  # r3
+    serial_number: str
+
+    @classmethod
+    def from_json(cls, text: str) -> Flic1UnlockResponse:
+        """Parse the JSON reply.
+
+        The cloud returns longer values than the protocol uses; like flicd and the
+        Flic app this takes the first 8 / 8 / 12 bytes of h1 / h2 / h3.
+        """
+        try:
+            data = json.loads(text)
+            return cls(
+                mac_address=str(data["mac_address"]),
+                h1=bytes.fromhex(data["h1"])[:8],
+                h2=bytes.fromhex(data["h2"])[:8],
+                h3=bytes.fromhex(data["h3"])[:12],
+                cloud_random=int(data["r3"]),
+                serial_number=str(data.get("factory_serial", "")),
+            )
+        except (KeyError, TypeError, ValueError) as err:
+            msg = "Invalid reply of the Flic cloud"
+            raise ValueError(msg) from err
