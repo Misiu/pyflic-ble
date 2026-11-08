@@ -1,4 +1,4 @@
-"""Cryptographic operations for Flic 2 protocol."""
+"""Cryptographic operations for the Flic protocols."""
 
 from __future__ import annotations
 
@@ -263,3 +263,43 @@ def derive_full_verify_keys(
     pairing_key = pairing_material[4:20]  # 16 bytes
 
     return verifier, session_key, pairing_key, pairing_id, full_verify_secret
+
+
+# =============================================================================
+# Flic 1: SHA-256 based message authentication
+# =============================================================================
+
+
+def flic1_sha256(*parts: bytes) -> bytes:
+    """Compute the SHA-256 hash of the concatenated parts."""
+    return hashlib.sha256(b"".join(parts)).digest()
+
+
+def flic1_hello_mac_valid(hello: bytes, key: bytes) -> bool:
+    """Check the MAC of a Flic 1 hello.
+
+    The MAC covers bytes 0-16 and sits in bytes 17-19. Older firmware covers
+    bytes 0-13 and puts the MAC in bytes 14-16; both forms are accepted.
+    """
+    if len(hello) != 20:
+        return False
+    return hmac.compare_digest(
+        flic1_sha256(hello[:17], key)[:3], hello[17:20]
+    ) or hmac.compare_digest(flic1_sha256(hello[:14], key)[:3], hello[14:17])
+
+
+def flic1_packet_mac(body: bytes, counter: int, nonce: bytes, key: bytes) -> bytes:
+    """Compute the 4 byte MAC of a packet sent to a Flic 1 button."""
+    return flic1_sha256(body, counter.to_bytes(4, "little"), nonce, key)[:4]
+
+
+def flic1_event_mac_valid(frame: bytes, key: bytes) -> bool:
+    """Check the MAC of a 15 byte Flic 1 event frame."""
+    if len(frame) < 15:
+        return False
+    return hmac.compare_digest(flic1_sha256(frame[:11], key)[:4], frame[11:15])
+
+
+def flic1_ready_hash(nonce: bytes, random_bytes: bytes, key: bytes) -> bytes:
+    """Compute the 14 byte proof in the frame that confirms a Flic 1 quick verify."""
+    return flic1_sha256(nonce, random_bytes, key)[:14]
